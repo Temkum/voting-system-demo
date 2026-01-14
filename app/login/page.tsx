@@ -31,10 +31,10 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-8 flex items-center justify-center">
+    <div className="min-h-screen bg-linear-to-br from-blue-50 to-indigo-100 p-8 flex items-center justify-center">
       <Card className="w-full max-w-md">
         <CardHeader className="">
-          <CardTitle className="">Welcome Back</CardTitle>
+          <CardTitle className="text-center">Welcome Back</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
           {error && (
@@ -58,7 +58,7 @@ export default function LoginPage() {
           />
           <Button
             onClick={handleSubmit}
-            className="w-full"
+            className="w-full cursor-pointer"
             disabled={isLoading}
             variant="default"
             size="default"
@@ -66,7 +66,7 @@ export default function LoginPage() {
             {isLoading ? 'Signing in...' : 'Sign In'}
           </Button>
           <p className="text-sm text-center">
-            Don't have an account?{' '}
+            No account yet?{' '}
             <Link href="/register" className="text-blue-600">
               Register
             </Link>

@@ -41,6 +41,10 @@ export const pollApi = {
     const { data } = await api.post('/polls', { title, options });
     return data;
   },
+  getById: async (id: string) => {
+    const { data } = await api.get(`/polls/${id}`);
+    return data;
+  },
 };
 
 export const voteApi = {

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -10,29 +10,8 @@ import { Users, Clock, TrendingUp, CheckCircle2 } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 import { useSocket } from '@/hooks/useSocket';
 import { pollApi, voteApi } from '@/lib/api';
-
-interface PollOption {
-  id: string;
-  text: string;
-  votes: number;
-}
-
-interface Poll {
-  _id: string;
-  title: string;
-  options: PollOption[];
-  createdBy: { _id: string; name: string; email: string };
-  totalVotes: number;
-  isActive: boolean;
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface LiveUpdate {
-  id: string;
-  message: string;
-  timestamp: string;
-}
+import PollCard from './PollCard';
+import { LiveUpdate, Poll } from '@/types';
 
 export default function DashboardPage() {
   const router = useRouter();
@@ -59,43 +38,28 @@ export default function DashboardPage() {
     }
   }, [user, authLoading, router]);
 
-  useEffect(() => {
-    if (user) {
-      fetchPolls();
+  const showNotification = useCallback(
+    (type: 'success' | 'error', message: string) => {
+      setNotification({ type, message });
+      setTimeout(() => setNotification(null), 3000);
+    },
+    []
+  );
 
-      const unsubscribeCreated = onPollCreated((poll) => {
-        setPolls((prev) => [poll, ...prev]);
-        addLiveUpdate(`New poll created: ${poll.title}`);
-      });
-
-      const unsubscribeUpdated = onPollUpdated((updatedPoll) => {
-        setPolls((prev) =>
-          prev.map((p) => (p._id === updatedPoll._id ? updatedPoll : p))
-        );
-        addLiveUpdate(`Vote registered on: ${updatedPoll.title}`);
-      });
-
-      return () => {
-        unsubscribeCreated();
-        unsubscribeUpdated();
-      };
-    }
-  }, [user]);
-
-  const fetchPolls = async () => {
+  const fetchPolls = useCallback(async () => {
+    if (!user) return;
     try {
       setIsLoadingPolls(true);
       const data = await pollApi.getAll();
       setPolls(data);
 
+      // TODO: req backend to return hasVoted in poll list
       const voted = new Set<string>();
       for (const poll of data) {
         try {
           const { hasVoted } = await voteApi.checkVoted(poll._id);
           if (hasVoted) voted.add(poll._id);
-        } catch (err) {
-          console.error('Check voted error:', err);
-        }
+        } catch {}
       }
       setVotedPolls(voted);
     } catch (err) {
@@ -104,21 +68,40 @@ export default function DashboardPage() {
     } finally {
       setIsLoadingPolls(false);
     }
-  };
+  }, [user, showNotification]);
 
-  const addLiveUpdate = (message: string) => {
+  // global listeners
+  useEffect(() => {
+    if (!user) return;
+
+    fetchPolls();
+
+    const unsubscribeCreated = onPollCreated((newPoll: Poll) => {
+      setPolls((prev) => [newPoll, ...prev]);
+      addLiveUpdate(`New poll created: ${newPoll.title}`);
+    });
+
+    const unsubscribeUpdated = onPollUpdated((updatedPoll: Poll) => {
+      setPolls((prev) =>
+        prev.map((p) => (p._id === updatedPoll._id ? updatedPoll : p))
+      );
+      addLiveUpdate(`Vote registered on: ${updatedPoll.title}`);
+    });
+
+    return () => {
+      unsubscribeCreated();
+      unsubscribeUpdated();
+    };
+  }, [user, onPollCreated, onPollUpdated, fetchPolls]);
+
+  const addLiveUpdate = useCallback((message: string) => {
     const update: LiveUpdate = {
       id: Date.now().toString(),
       message,
       timestamp: new Date().toLocaleTimeString(),
     };
     setLiveUpdates((prev) => [update, ...prev].slice(0, 5));
-  };
-
-  const showNotification = (type: string, message: string) => {
-    setNotification({ type, message });
-    setTimeout(() => setNotification(null), 3000);
-  };
+  }, []);
 
   const handleCreatePoll = async () => {
     const validOptions = newPollOptions.filter((o) => o.trim());
@@ -134,49 +117,69 @@ export default function DashboardPage() {
       setNewPollOptions(['', '']);
       showNotification('success', 'Poll created successfully!');
     } catch (err) {
-      console.error('Create poll error:', err);
       showNotification('error', 'Failed to create poll');
     } finally {
       setIsCreating(false);
     }
   };
 
-  const handleVote = async (pollId: string, optionId: string) => {
-    if (votedPolls.has(pollId)) {
-      showNotification('error', 'Already voted on this poll');
-      return;
-    }
+  // Optimistic vote + rollback on error
+  const handleVote = useCallback(
+    async (pollId: string, optionId: string) => {
+      if (votedPolls.has(pollId)) {
+        showNotification('error', 'You already voted on this poll');
+        return;
+      }
 
-    try {
-      await voteApi.vote(pollId, optionId);
-      setVotedPolls((prev) => new Set(prev).add(pollId));
-      showNotification('success', 'Vote submitted! Processing...');
-    } catch (err: any) {
-      console.error('Vote error:', err);
-      showNotification('error', err.response?.data?.error || 'Failed to vote');
-    }
-  };
+      // 1. Optimistic UI update
+      setPolls((prevPolls) =>
+        prevPolls.map((p) =>
+          p._id === pollId
+            ? {
+                ...p,
+                options: p.options.map((opt) =>
+                  opt.id === optionId ? { ...opt, votes: opt.votes + 1 } : opt
+                ),
+                totalVotes: p.totalVotes + 1,
+              }
+            : p
+        )
+      );
+
+      try {
+        await voteApi.vote(pollId, optionId);
+        setVotedPolls((prev) => new Set([...prev, pollId]));
+        showNotification('success', 'Vote submitted!');
+      } catch (err: any) {
+        // Rollback: refetch or revert (simplest = refetch)
+        console.error('Vote failed:', err);
+        showNotification(
+          'error',
+          err.response?.data?.error || 'Failed to vote'
+        );
+        fetchPolls(); // Re-sync from server
+      }
+    },
+    [votedPolls, showNotification, fetchPolls]
+  );
 
   const handleLogout = () => {
     logout();
     router.push('/login');
   };
 
-  if (authLoading) {
+  if (authLoading)
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <p>Loading...</p>
+        Loading...
       </div>
     );
-  }
-
-  if (!user) {
-    return null;
-  }
+  if (!user) return null;
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-8">
+    <div className="min-h-screen bg-linear-to-br from-blue-50 to-indigo-100 p-8">
       <div className="max-w-7xl mx-auto space-y-6">
+        {/* Header */}
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-3xl font-bold text-gray-900">
@@ -203,6 +206,7 @@ export default function DashboardPage() {
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2 space-y-6">
+            {/* Create Poll */}
             <Card>
               <CardHeader>
                 <CardTitle>Create New Poll</CardTitle>
@@ -240,18 +244,30 @@ export default function DashboardPage() {
               </CardContent>
             </Card>
 
+            {/* Polls List with Skeleton */}
             {isLoadingPolls ? (
-              <Card>
-                <CardContent className="py-8 text-center">
-                  <p className="text-gray-500">Loading polls...</p>
-                </CardContent>
-              </Card>
+              <div className="space-y-6">
+                {[...Array(3)].map((_, i) => (
+                  <Card key={i} className="animate-pulse">
+                    <CardHeader>
+                      <div className="h-7 w-3/4 bg-gray-300 rounded" />
+                      <div className="h-4 w-1/2 bg-gray-300 rounded mt-2" />
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                      {[...Array(3)].map((__, j) => (
+                        <div key={j} className="space-y-2">
+                          <div className="h-10 bg-gray-300 rounded" />
+                          <div className="h-2 bg-gray-300 rounded-full" />
+                        </div>
+                      ))}
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
             ) : polls.length === 0 ? (
               <Card>
-                <CardContent className="py-8 text-center">
-                  <p className="text-gray-500">
-                    No polls yet. Create one above!
-                  </p>
+                <CardContent className="py-12 text-center text-gray-500">
+                  No polls yet. Create one above!
                 </CardContent>
               </Card>
             ) : (
@@ -268,6 +284,7 @@ export default function DashboardPage() {
             )}
           </div>
 
+          {/* Sidebar */}
           <div className="space-y-6">
             <Card>
               <CardHeader>
@@ -282,17 +299,17 @@ export default function DashboardPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="space-y-2">
+                <div className="space-y-3">
                   {liveUpdates.length === 0 ? (
                     <p className="text-sm text-gray-500">No updates yet</p>
                   ) : (
                     liveUpdates.map((update) => (
                       <div
                         key={update.id}
-                        className="border-l-2 border-blue-500 pl-3 py-2"
+                        className="border-l-4 border-blue-500 pl-3 py-1.5 bg-blue-50/40 rounded-r"
                       >
                         <p className="text-sm font-medium">{update.message}</p>
-                        <p className="text-xs text-gray-500">
+                        <p className="text-xs text-gray-500 mt-0.5">
                           {update.timestamp}
                         </p>
                       </div>
@@ -328,82 +345,5 @@ export default function DashboardPage() {
         </div>
       </div>
     </div>
-  );
-}
-
-// poll card component
-interface PollCardProps {
-  poll: Poll;
-  hasVoted: boolean;
-  onVote: (pollId: string, optionId: string) => void;
-  joinPoll: (pollId: string) => void;
-  leavePoll: (pollId: string) => void;
-}
-
-function PollCard({
-  poll,
-  hasVoted,
-  onVote,
-  joinPoll,
-  leavePoll,
-}: PollCardProps) {
-  useEffect(() => {
-    joinPoll(poll._id);
-    return () => leavePoll(poll._id);
-  }, [poll._id]);
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center justify-between">
-          <span className="flex-1">{poll.title}</span>
-          <span className="text-sm font-normal text-gray-500 flex items-center gap-1">
-            <Users className="w-4 h-4" />
-            {poll.totalVotes}
-          </span>
-        </CardTitle>
-        <div className="text-sm text-gray-600 flex items-center gap-2">
-          <Clock className="w-4 h-4" />
-          {new Date(poll.createdAt).toLocaleString()} • by {poll.createdBy.name}
-        </div>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {poll.options.map((option) => {
-          const percentage =
-            poll.totalVotes > 0
-              ? Math.round((option.votes / poll.totalVotes) * 100)
-              : 0;
-
-          return (
-            <div key={option.id} className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Button
-                  variant="outline"
-                  className="flex-1 justify-start"
-                  onClick={() => onVote(poll._id, option.id)}
-                  disabled={hasVoted}
-                >
-                  {option.text}
-                </Button>
-                <span className="ml-4 text-sm font-medium w-24 text-right">
-                  {option.votes} ({percentage}%)
-                </span>
-              </div>
-              <div className="w-full bg-gray-200 rounded-full h-2">
-                <div
-                  className="bg-blue-600 h-2 rounded-full transition-all duration-500"
-                  style={{ width: `${percentage}%` }}
-                />
-              </div>
-            </div>
-          );
-        })}
-        {hasVoted && (
-          <p className="text-sm text-green-600 text-center mt-2">
-            ✓ You voted on this poll
-          </p>
-        )}
-      </CardContent>
-    </Card>
   );
 }
